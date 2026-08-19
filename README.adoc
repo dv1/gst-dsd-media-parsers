@@ -20,24 +20,21 @@ The build was tested with meson 1.11.1, but older versions should be supported a
 
 A C++20 capable compiler is required.
 
-Create a build directory for an out-of-tree build:
+Setup the Meson build:
 
-    make build
-    cd build
-
-Now set up the build by running meson:
-
-    meson ..
+    meson setup build .
 
 You might want to look into the `--buildtype=plain` flag if the compiler flags Meson adds are a problem.
 This is particularly useful for packagers. https://mesonbuild.com/Quick-guide.html#using-meson-as-a-distro-packager[Read here for more.]
 
+For a debug build, add the `-Dbuildtype=debug` flag. `-Dwarning_level=3` is useful for extra compiler warnings.
+
 Also, you might be interested in the `-Dprefix` and `-Dlibdir` arguments to control where to install the
 resulting binaries. Again, this is particularly useful for packagers.
 
-Finally, build and install the code by running ninja:
+Finally, build and install the code by running:
 
-    ninja install
+    meson compile -C build
 
 
 == Available GStreamer elements
