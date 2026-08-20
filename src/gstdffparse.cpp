@@ -644,9 +644,9 @@ static GstTagList* gst_dffparse_fill_tags(GstDsdMediaParse *parse, GstTagList *t
 {
 	GstDFFParse *self = GST_DFFPARSE(parse);
 
-	if (self->prop_data.title.has_value())
+	if (self->prop_data.title.has_value() && !(self->prop_data.title->empty()))
 		gst_tag_list_add(tag_list, GST_TAG_MERGE_APPEND, GST_TAG_TITLE, self->prop_data.title->c_str(), nullptr);
-	if (self->prop_data.artist.has_value())
+	if (self->prop_data.artist.has_value() && !(self->prop_data.artist->empty()))
 		gst_tag_list_add(tag_list, GST_TAG_MERGE_APPEND, GST_TAG_ARTIST, self->prop_data.artist->c_str(), nullptr);
 
 	return tag_list;
