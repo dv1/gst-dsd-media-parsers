@@ -1004,6 +1004,24 @@ static GstFlowReturn gst_dsfparse_parse_chunk_fmt(gpointer user_data, const Chun
 	}
 
 	guint64 num_dsd_bits = GST_READ_UINT64_LE(mapped_fmt_data.data() + 24);
+	if (G_UNLIKELY(num_dsd_bits > (G_MAXUINT64 - 7))) {
+		// The conversion to bytes below rounds up by adding 7, which would
+		// wrap around in very rare cases where the bit count is already close
+		// to the maximum of the 64-bit unsigned integer range. The result
+		// would be a tiny (or zero) byte count due to wrap around. This
+		// would silently discard the entire payload.
+		GST_ELEMENT_ERROR(
+			self,
+			STREAM,
+			DEMUX,
+			("Invalid DSF sample count."),
+			(
+				"number of DSD bits %" G_GUINT64_FORMAT " is out of range",
+				num_dsd_bits
+			)
+		);
+		return GST_FLOW_ERROR;
+	}
 	if (G_UNLIKELY(num_dsd_bits == 0)) {
 		GST_ELEMENT_ERROR(
 			self,
