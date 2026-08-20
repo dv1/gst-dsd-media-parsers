@@ -3568,7 +3568,8 @@ void gst_dsd_media_parse_configure(GstDsdMediaParse *parse, GstCaps *output_caps
 }
 
 
-GstFlowReturn gst_dsd_media_parse_report_payload_found(GstDsdMediaParse *parse, guint64 payload_size)
+GstFlowReturn gst_dsd_media_parse_report_payload_found(GstDsdMediaParse *parse, guint64 payload_size,
+                                                       bool force_immediate_streaming)
 {
 	g_assert(GST_IS_DSD_MEDIA_PARSE(parse));
 	g_return_val_if_fail(payload_size > 0, GST_FLOW_ERROR);
@@ -3590,7 +3591,7 @@ GstFlowReturn gst_dsd_media_parse_report_payload_found(GstDsdMediaParse *parse, 
 
 	g_assert(priv->upstream_is_seekable.has_value());
 
-	if (*(priv->upstream_is_seekable)) {
+	if (*(priv->upstream_is_seekable) && !force_immediate_streaming) {
 		GST_DEBUG_OBJECT(
 			parse,
 			"found payload of size %" G_GUINT64_FORMAT " at position %" G_GUINT64_FORMAT "; "
@@ -3619,12 +3620,21 @@ GstFlowReturn gst_dsd_media_parse_report_payload_found(GstDsdMediaParse *parse, 
 
 		return GST_FLOW_OK;
 	} else {
-		GST_DEBUG_OBJECT(
-			parse,
-			"found payload at position %" G_GUINT64_FORMAT ", but seeking is not possible; "
-			"cannot skip payload to parse data behind it; start streaming immediately instead",
-			*(priv->payload_position)
-		);
+		if (force_immediate_streaming) {
+			GST_DEBUG_OBJECT(
+				parse,
+				"found payload at position %" G_GUINT64_FORMAT ", and caller "
+				"requested to start the Streaming stage immediately",
+				*(priv->payload_position)
+			);
+		} else {
+			GST_DEBUG_OBJECT(
+				parse,
+				"found payload at position %" G_GUINT64_FORMAT ", but seeking is not possible; "
+				"cannot skip payload to parse data behind it; start streaming immediately instead",
+				*(priv->payload_position)
+			);
+		}
 
 		{
 			std::lock_guard<std::mutex> lock(priv->field_mutex);

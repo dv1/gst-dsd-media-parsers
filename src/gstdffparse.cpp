@@ -236,6 +236,9 @@ struct _GstDFFParse
 
 	// Set when handling the DSD chunk.
 	guint64 total_num_indices;
+
+	// Set when the FRM8 chunk's start is parsed.
+	guint64 upstream_size;
 };
 
 
@@ -661,9 +664,10 @@ static void gst_dffparse_current_index_after_seek(GstDsdMediaParse *parse, guint
 static void gst_dffparse_reset_all_fields(GstDFFParse *self)
 {
 	self->prop_data = PropData();
-	self->total_num_indices = 0;
 	self->output_buffer_size = 0;
 	self->current_index = 0;
+	self->total_num_indices = 0;
+	self->upstream_size = 0;
 }
 
 
@@ -755,9 +759,9 @@ static GstFlowReturn gst_dffparse_parse_chunk_frm8(gpointer user_data, const Chu
 	}
 
 	// Query the upstream size in bytes as a safeguard in case
-	// the FRM8 chunk's specified length is incorrect.
-	guint64 upstream_size;
-	if (!gst_dsd_media_parse_get_upstream_size(parse, &upstream_size)) {
+	// the FRM8 chunk's specified length is incorrect. Also,
+	// other chunk parsers will need this size for their processing.
+	if (!gst_dsd_media_parse_get_upstream_size(parse, &(self->upstream_size))) {
 		GST_ELEMENT_ERROR(
 			self,
 			STREAM,
@@ -770,7 +774,7 @@ static GstFlowReturn gst_dffparse_parse_chunk_frm8(gpointer user_data, const Chu
 
 	// DFF media with less than 12 bytes cannot exist,
 	// since that is the size of a chunk header.
-	if (upstream_size < 12) {
+	if (self->upstream_size < 12) {
 		GST_ELEMENT_ERROR(
 			self,
 			STREAM,
@@ -779,32 +783,30 @@ static GstFlowReturn gst_dffparse_parse_chunk_frm8(gpointer user_data, const Chu
 			(
 				"upstream duration query reports a size of %" G_GINT64_FORMAT
 				" byte(s), which is not valid DFF",
-				upstream_size
+				self->upstream_size
 			)
 		);
 		return GST_FLOW_ERROR;
 	}
 
-	GST_DEBUG_OBJECT(self, "upstream specifies a size of %" G_GINT64_FORMAT " byte(s)", upstream_size);
+	GST_DEBUG_OBJECT(self, "upstream specifies a size of %" G_GINT64_FORMAT " byte(s)", self->upstream_size);
 
 	// The expected chunk size is the size upstream
 	// reported, minus the bytes for the FRM8 header.
-	guint64 expected_chunk_size = upstream_size - 12;
+	// This value is not reliable enough though - reporting
+	// an error based on a size mismatch won't work correctly
+	// with truncated but still playable files. For this
+	// reason, size mismatches are merely logged as warnings.
+	guint64 expected_chunk_size = self->upstream_size - 12;
 
 	if (chunk.size > expected_chunk_size) {
-		GST_ELEMENT_ERROR(
+		GST_WARNING_OBJECT(
 			self,
-			STREAM,
-			DEMUX,
-			("Invalid size of DFF medium."),
-			(
-				"FRM8 chunk size %" G_GUINT64_FORMAT " is larger than the expected "
-				"chunk size %" G_GUINT64_FORMAT " according to reported upstream size",
-				chunk.size,
-				expected_chunk_size
-			)
+			"FRM8 chunk size %" G_GUINT64_FORMAT " is larger than the expected "
+			"chunk size %" G_GUINT64_FORMAT " according to reported upstream size",
+			chunk.size,
+			expected_chunk_size
 		);
-		return GST_FLOW_ERROR;
 	} else if (chunk.size < expected_chunk_size) {
 		GST_WARNING_OBJECT(
 			self,
@@ -1527,12 +1529,49 @@ static GstFlowReturn gst_dffparse_parse_chunk_dsd(gpointer user_data, const Chun
 		return GST_FLOW_ERROR;
 	}
 
+	// Verify the chunk size. In truncated files, the number of available
+	// bytes will be smaller than that size. This is therefore an indicator
+	// that the DSD data is truncated.
+	guint64 payload_size = chunk.size;
+	guint64 num_available_bytes = self->upstream_size - gst_dsd_media_parse_get_current_byte_position(parse);
+	bool data_truncated = false;
+
+	if (G_UNLIKELY(num_available_bytes < *(self->prop_data.num_channels))) {
+		GST_ELEMENT_ERROR(
+			self,
+			STREAM,
+			DEMUX,
+			("Insufficient DFF payload."),
+			(
+				"only %" G_GUINT64_FORMAT " payload byte(s) are available; frame size is %"
+				G_GUINT16_FORMAT "; cannot play this residual data",
+				num_available_bytes,
+				*(self->prop_data.num_channels)
+			)
+		);
+		return GST_FLOW_ERROR;
+	}
+
+	if (G_UNLIKELY(payload_size > num_available_bytes)) {
+		GST_WARNING_OBJECT(
+			self,
+			"DSD chunk declares %" G_GUINT64_FORMAT " payload byte(s), but only %"
+			G_GUINT64_FORMAT " byte(s) are available; the medium seems to be "
+			"truncated; clamping the payload size",
+			payload_size,
+			num_available_bytes
+		);
+		payload_size = num_available_bytes;
+		data_truncated = true;
+	}
+
 	// Deliberately truncating: a residual partial frame at the end of the payload
-	// cannot be output. Note that report_payload_found() below still gets the full
-	// chunk.size, so end_payload_position may lie a few bytes past
-	// from_index(BYTES, total_num_indices). gst_dffparse_produce_output() handles
-	// that by reporting EOS once fewer than num_channels bytes remain.
-	self->total_num_indices = chunk.size / *(self->prop_data.num_channels);
+	// cannot be output. Note that report_payload_found() below gets the unrounded
+	// payload_size rather than the index-aligned byte count, so end_payload_position
+	// may lie a few bytes past from_index(BYTES, total_num_indices).
+	// gst_dffparse_produce_output() handles that by reporting EOS once fewer than
+	// num_channels bytes remain.
+	self->total_num_indices = payload_size / *(self->prop_data.num_channels);
 	GST_DEBUG_OBJECT(self, "total number of indices is %" G_GUINT64_FORMAT, self->total_num_indices);
 
 	// Use the _ceil variant of this function, since this is a duration calculation.
@@ -1566,7 +1605,7 @@ static GstFlowReturn gst_dffparse_parse_chunk_dsd(gpointer user_data, const Chun
 		duration
 	);
 
-	GstFlowReturn flow_ret = gst_dsd_media_parse_report_payload_found(parse, chunk.size);
+	GstFlowReturn flow_ret = gst_dsd_media_parse_report_payload_found(parse, payload_size, data_truncated);
 	if (flow_ret != GST_FLOW_OK)
 		return flow_ret;
 

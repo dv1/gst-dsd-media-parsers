@@ -617,16 +617,28 @@ void gst_dsd_media_parse_configure(GstDsdMediaParse *parse, GstCaps *output_caps
  *
  * See the overview for more about this function.
  *
+ * gst_dsd_media_parse_configure() must have been called before this function
+ * runs, because this function may immediately switch to the Streaming stage
+ * (see below). If gst_dsd_media_parse_configure() wasn't called before that
+ * stage is switched to, the base class reports an error.
+ *
  * This must not be called outside of scan_info(), and even then, must not
  * be called more than once in there.
  *
  * payload_size must be nonzero.
  *
+ * If force_immediate_streaming is true, this behaves as if upstream didn't
+ * support seeking - that is, it immediately switches to the Streaming stage
+ * instead of skipping the payload. This is useful for handling truncated
+ * files, when the subclass is certain that nothing exists past the payload
+ * (the data that normally would be there is absent due to the truncation).
+ *
  * This returns GST_FLOW_OK upon success. If this returns anything other
  * than GST_FLOW_OK, the scan_info() vmethod must return that flow return
  * code.
  */
-GstFlowReturn gst_dsd_media_parse_report_payload_found(GstDsdMediaParse *parse, guint64 payload_size);
+GstFlowReturn gst_dsd_media_parse_report_payload_found(GstDsdMediaParse *parse, guint64 payload_size,
+                                                       bool force_immediate_streaming);
 
 /**
  * Informs the base class that during the Scanning Info stage, the subclass found the end of the media.

@@ -82,7 +82,10 @@ GST_DEBUG_CATEGORY_STATIC(dsfparse_debug);
 //
 // total_num_indices is computed alongside the duration, in this manner:
 //
-//   total_num_indices = ceil(num_dsd_bytes_per_channel / block_size)
+//   total_num_indices = ceil(actual_num_dsd_bytes_per_channel / block_size)
+//
+// (See the comment above actual_num_dsd_bytes_per_channel and
+// expected_num_dsd_bytes_per_channel for details about what "actual" means.)
 //
 // The rounding is upwards because the DSF specification requires the last
 // block to be zero padded if there is not enough sample data left to fill
@@ -127,7 +130,21 @@ struct FmtData {
 	guint32 num_channels;
 	std::vector<GstAudioChannelPosition> channel_positions;
 	bool reversed_bytes;
-	guint64 num_dsd_bytes_per_channel;
+
+	// expected_num_dsd_bytes_per_channel contains a value
+	// that the DSF spec refers to as "Sample count". That
+	// value is originally given in bits - the parser here
+	// converts it into bytes.
+	// If the DSF media is okay, actual_num_dsd_bytes_per_channel
+	// matches expected_num_dsd_bytes_per_channel. But if it
+	// is truncated, actual_num_dsd_bytes_per_channel is
+	// calculated out of the actual number of available DSD
+	// bytes. The expected value is still important though
+	// to handle the last-block padding correctly, so both
+	// are kept here.
+	guint64 expected_num_dsd_bytes_per_channel;
+	guint64 actual_num_dsd_bytes_per_channel;
+
 	guint32 block_size;
 };
 
@@ -143,8 +160,8 @@ struct _GstDSFParse
 	// and set in gst_dsfparse_current_index_after_seek().
 	guint64 current_index;
 
-	// Calculated out of fmt_data's num_dsd_bytes_per_channel.
-	// Only valid once fmt_data is set.
+	// Calculated out of fmt_data's actual_num_dsd_bytes_per_channel.
+	// Only valid once the data chunk has been parsed.
 	guint64 total_num_indices;
 
 	// This is set to num_channels * block_size in the fmt chunk parser.
@@ -570,7 +587,8 @@ static GstFlowReturn gst_dsfparse_parse_chunk_dsf_header(gpointer user_data, con
 		);
 
 		// Query the upstream size in bytes as a safeguard in case
-		// the total file size from the header is incorrect.
+		// the total file size from the header is incorrect. Also,
+		// other chunk parsers will need this size for their processing.
 		if (!gst_dsd_media_parse_get_upstream_size(parse, &(self->upstream_size))) {
 			GST_ELEMENT_ERROR(
 				self,
@@ -602,21 +620,20 @@ static GstFlowReturn gst_dsfparse_parse_chunk_dsf_header(gpointer user_data, con
 
 		GST_DEBUG_OBJECT(self, "upstream specifies a size of %" G_GUINT64_FORMAT " byte(s)", self->upstream_size);
 
+		// In truncated files, total_file_size will be larger than upstream_size.
+		// Such files may still be playable though, so we cannot use this comparison
+		// as a basis for GST_ELEMENT_ERROR() calls and for returning GST_FLOW_ERROR.
+		// Instead, merely log this as a warning.
+
 		if (total_file_size > self->upstream_size) {
-			GST_ELEMENT_ERROR(
+			GST_WARNING_OBJECT(
 				self,
-				STREAM,
-				DEMUX,
-				("Invalid size of DSF medium."),
-				(
-					"upstream duration query reports a size of %" G_GUINT64_FORMAT
-					" byte(s), but DSF header chunk reports a total file size of %"
-					G_GUINT64_FORMAT " byte(s)",
-					self->upstream_size,
-					total_file_size
-				)
+				"upstream duration query reports a size of %" G_GUINT64_FORMAT
+				" byte(s), but DSF header chunk reports a total file size of %"
+				G_GUINT64_FORMAT " byte(s)",
+				self->upstream_size,
+				total_file_size
 			);
-			return GST_FLOW_ERROR;
 		} else if (total_file_size < self->upstream_size) {
 			GST_WARNING_OBJECT(
 				self,
@@ -999,13 +1016,8 @@ static GstFlowReturn gst_dsfparse_parse_chunk_fmt(gpointer user_data, const Chun
 	}
 
 	GST_DEBUG_OBJECT(self, "media contains %" G_GUINT64_FORMAT " dsd bits", num_dsd_bits);
-	new_fmt_data.num_dsd_bytes_per_channel = (num_dsd_bits + 7) / 8;
-
-	GstClockTime duration = gst_util_uint64_scale_int_ceil(
-		new_fmt_data.num_dsd_bytes_per_channel,
-		GST_SECOND,
-		new_fmt_data.sample_rate
-	);
+	new_fmt_data.expected_num_dsd_bytes_per_channel = (num_dsd_bits + 7) / 8;
+	new_fmt_data.actual_num_dsd_bytes_per_channel = new_fmt_data.expected_num_dsd_bytes_per_channel;
 
 	new_fmt_data.block_size = GST_READ_UINT32_LE(mapped_fmt_data.data() + 32);
 	if (G_UNLIKELY(new_fmt_data.block_size == 0)) {
@@ -1024,32 +1036,7 @@ static GstFlowReturn gst_dsfparse_parse_chunk_fmt(gpointer user_data, const Chun
 	self->alignment = guint64(new_fmt_data.block_size) * guint64(new_fmt_data.num_channels);
 	GST_DEBUG_OBJECT(self, "alignment is %" G_GUINT64_FORMAT " byte(s)", self->alignment);
 
-	// Round up when calculating the total number of indices
-	// to account for partial data at the very last index.
-	self->total_num_indices = (new_fmt_data.num_dsd_bytes_per_channel + (new_fmt_data.block_size - 1)) / new_fmt_data.block_size;
-	GST_DEBUG_OBJECT(self, "total number of indices is %" G_GUINT64_FORMAT, self->total_num_indices);
-
 	// The last 4 bytes in the 40 byte chunk payload are reserved.
-
-	GstDsdInfo output_dsd_info;
-
-	gst_dsd_info_set_format(
-		&output_dsd_info,
-		GST_DSD_FORMAT_U8,
-		new_fmt_data.sample_rate,
-		new_fmt_data.num_channels,
-		new_fmt_data.channel_positions.data()
-	);
-	GST_DSD_INFO_LAYOUT(&output_dsd_info) = GST_AUDIO_LAYOUT_NON_INTERLEAVED;
-	GST_DSD_INFO_REVERSED_BYTES(&output_dsd_info) = new_fmt_data.reversed_bytes;
-
-	GstCaps *output_caps = gst_dsd_info_to_caps(&output_dsd_info);
-
-	gst_dsd_media_parse_configure(
-		parse,
-		output_caps,
-		duration
-	);
 
 	self->fmt_data = new_fmt_data;
 
@@ -1068,7 +1055,7 @@ static GstFlowReturn gst_dsfparse_parse_chunk_data(gpointer user_data, const Chu
 	// gst_dsd_media_parse_report_payload_found() cannot reliably
 	// be called, since the base class must be configured prior
 	// to that call - and gst_dsd_media_parse_configure() is
-	// called in the fmt chunk parser.
+	// called right here, further below.
 	if (G_UNLIKELY(!self->fmt_data.has_value())) {
 		GST_ELEMENT_ERROR(
 			self,
@@ -1080,11 +1067,53 @@ static GstFlowReturn gst_dsfparse_parse_chunk_data(gpointer user_data, const Chu
 		return GST_FLOW_ERROR;
 	}
 
+	// Verify the chunk size. In truncated files, the number of available
+	// bytes will be smaller than that size. This is therefore an indicator
+	// that the DSD data is truncated.
+	guint64 payload_size = chunk.size;
+	guint64 num_available_bytes = self->upstream_size - gst_dsd_media_parse_get_current_byte_position(parse);
+	bool data_truncated = false;
+
+	if (G_UNLIKELY(num_available_bytes < self->alignment)) {
+		GST_ELEMENT_ERROR(
+			self,
+			STREAM,
+			DEMUX,
+			("Insufficient DSF payload."),
+			(
+				"only %" G_GUINT64_FORMAT " payload byte(s) are available; alignment is %"
+				G_GUINT64_FORMAT "; cannot play this residual data",
+				num_available_bytes,
+				self->alignment
+			)
+		);
+		return GST_FLOW_ERROR;
+	}
+
+	if (G_UNLIKELY(payload_size > num_available_bytes)) {
+		GST_WARNING_OBJECT(
+			self,
+			"data chunk declares %" G_GUINT64_FORMAT " payload byte(s), but only %"
+			G_GUINT64_FORMAT " byte(s) are available; the medium seems to be "
+			"truncated; clamping the payload size",
+			payload_size,
+			num_available_bytes
+		);
+		payload_size = num_available_bytes;
+		data_truncated = true;
+
+		// We also need to recalculate actual_num_dsd_bytes_per_channel,
+		// since the original value does not match the actual truncated data size.
+
+		self->fmt_data->actual_num_dsd_bytes_per_channel = payload_size / self->fmt_data->num_channels;
+		GST_DEBUG_OBJECT(self, "recalculated number of DSD bytes per channel to %" G_GUINT64_FORMAT, self->fmt_data->actual_num_dsd_bytes_per_channel);
+	}
+
 	// Check that the data chunk's size is an integer multiple
 	// of the alignment value. If not, there's partial data,
 	// and a warning about that is logged.
 	{
-		guint64 remainder = chunk.size % self->alignment;
+		guint64 remainder = payload_size % self->alignment;
 		if (remainder != 0) {
 			GST_WARNING_OBJECT(
 				self,
@@ -1097,9 +1126,40 @@ static GstFlowReturn gst_dsfparse_parse_chunk_data(gpointer user_data, const Chu
 		}
 	}
 
-	GST_DEBUG_OBJECT(self, "located DSD data with %" G_GUINT64_FORMAT " byte(s)", chunk.size);
+	// Round up when calculating the total number of indices
+	// to account for partial data at the very last index.
+	self->total_num_indices = (self->fmt_data->actual_num_dsd_bytes_per_channel + (self->fmt_data->block_size - 1)) / self->fmt_data->block_size;
+	GST_DEBUG_OBJECT(self, "total number of indices is %" G_GUINT64_FORMAT, self->total_num_indices);
 
-	GstFlowReturn flow_ret = gst_dsd_media_parse_report_payload_found(parse, chunk.size);
+	GstClockTime duration = gst_util_uint64_scale_int_ceil(
+		self->fmt_data->actual_num_dsd_bytes_per_channel,
+		GST_SECOND,
+		self->fmt_data->sample_rate
+	);
+
+	GstDsdInfo output_dsd_info;
+
+	gst_dsd_info_set_format(
+		&output_dsd_info,
+		GST_DSD_FORMAT_U8,
+		self->fmt_data->sample_rate,
+		self->fmt_data->num_channels,
+		self->fmt_data->channel_positions.data()
+	);
+	GST_DSD_INFO_LAYOUT(&output_dsd_info) = GST_AUDIO_LAYOUT_NON_INTERLEAVED;
+	GST_DSD_INFO_REVERSED_BYTES(&output_dsd_info) = self->fmt_data->reversed_bytes;
+
+	GstCaps *output_caps = gst_dsd_info_to_caps(&output_dsd_info);
+
+	gst_dsd_media_parse_configure(
+		parse,
+		output_caps,
+		duration
+	);
+
+	GST_DEBUG_OBJECT(self, "located DSD data with %" G_GUINT64_FORMAT " byte(s)", payload_size);
+
+	GstFlowReturn flow_ret = gst_dsd_media_parse_report_payload_found(parse, payload_size, data_truncated);
 	if (flow_ret != GST_FLOW_OK)
 		return flow_ret;
 
