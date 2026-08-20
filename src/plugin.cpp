@@ -34,12 +34,10 @@ static gboolean plugin_init(GstPlugin *plugin)
 	GST_DEBUG_CATEGORY_INIT(dsdchunkparse_debug, "dsdchunkparse", 0, "DSD chunk-based media parse base class");
 
 	gboolean ret = TRUE;
-
-	ret = ret && gst_element_register(plugin, "dffparse", GST_RANK_PRIMARY, gst_dffparse_get_type());
-	ret = ret && gst_type_find_register(plugin, GST_DFF_MEDIA_TYPE, GST_RANK_PRIMARY, gst_dffparse_type_find, "dff", nullptr, nullptr, nullptr);
-
-	ret = ret && gst_element_register(plugin, "dsfparse", GST_RANK_PRIMARY, gst_dsfparse_get_type());
-	ret = ret && gst_type_find_register(plugin, GST_DSF_MEDIA_TYPE, GST_RANK_PRIMARY, gst_dsfparse_type_find, "dsf", nullptr, nullptr, nullptr);
+	ret |= GST_ELEMENT_REGISTER(dffparse, plugin);
+	ret |= GST_ELEMENT_REGISTER(dsfparse, plugin);
+	ret |= gst_type_find_register(plugin, GST_DFF_MEDIA_TYPE, GST_RANK_PRIMARY, gst_dffparse_type_find, "dff", nullptr, nullptr, nullptr);
+	ret |= gst_type_find_register(plugin, GST_DSF_MEDIA_TYPE, GST_RANK_PRIMARY, gst_dsfparse_type_find, "dsf", nullptr, nullptr, nullptr);
 
 	return ret;
 }
