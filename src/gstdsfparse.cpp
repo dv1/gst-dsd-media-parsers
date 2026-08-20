@@ -451,6 +451,78 @@ static GstFlowReturn gst_dsfparse_produce_output(GstDsdMediaParse *parse, guint6
 	if (flow_ret != GST_FLOW_OK)
 		return flow_ret;
 
+	// Check how many bytes in the blocks of the current index are actually
+	// valid. In the vast majority of cases, this equals fmt_data->block_size.
+	// But at the very end, the last index may consist of blocks that have
+	// padding bytes filled in. For inexplicable reasons, the DSF spec requires
+	// these padding bytes to be 0x00, which is _not_ ideal for DSD. The 0x69
+	// silence pattern is the correct choice instead. Fix this DSF spec bug
+	// by detecting blocks with padding and overwriting the 0x00 padding bytes
+	// with the 0x69 DSD silence pattern.
+	guint64 block_begin = self->current_index * self->fmt_data->block_size;
+	guint64 num_valid_block_bytes = (block_begin < self->fmt_data->actual_num_dsd_bytes_per_channel)
+		? std::min(
+			guint64(self->fmt_data->block_size),
+			self->fmt_data->actual_num_dsd_bytes_per_channel - block_begin
+		) : 0;
+
+	if (num_valid_block_bytes < self->fmt_data->block_size) {
+		// If the bits in the DSD bytes are reversed, then so must be the silence
+		// pattern. Do so by calculating the complement of the silence pattern.
+		guint8 silence_pattern_byte = self->fmt_data->reversed_bytes
+			? (GST_DSD_SILENCE_PATTERN_BYTE ^ 0xFF)
+			: GST_DSD_SILENCE_PATTERN_BYTE;
+
+		guint64 num_dsd_padding_bytes = self->fmt_data->block_size - num_valid_block_bytes;
+
+		// The output_buffer's underlying GstMemory blocks may be shared
+		// with upstream or some other gstbuffers (adapter output in push
+		// mode, for instance). In such cases, a GST_MAP_WRITE mapping will
+		// be refused. Perform a deep buffer copy to guarantee that the
+		// mapping will succeed. Since this only affects the very last
+		// index in the media, the extra runtime cost is irrelevant.
+		GstBuffer *writable_buffer = gst_buffer_copy_deep(output_buffer);
+
+		// NOTE: Not using MappedBuffer here, since that helper is meant
+		// for temporary buffers that it takes ownership over.
+		GstMapInfo map_info;
+
+		if (G_LIKELY((writable_buffer != nullptr) &&
+			gst_buffer_map(writable_buffer, &map_info, GST_MAP_WRITE))
+		) {
+			gst_buffer_unref(output_buffer);
+			output_buffer = writable_buffer;
+
+			ScopeGuard unmap_guard([&]() { gst_buffer_unmap(output_buffer, &map_info); });
+
+			GST_DEBUG_OBJECT(
+				self,
+				"the blocks in this index %" G_GUINT64_FORMAT " have padding bytes; "
+				"overwriting the last %" G_GUINT64_FORMAT " byte(s) of each block "
+				"with DSD silence pattern byte %#04x",
+				self->current_index,
+				num_dsd_padding_bytes,
+				guint(silence_pattern_byte)
+			);
+
+			for (guint32 channel_index = 0; channel_index < self->fmt_data->num_channels; ++channel_index) {
+				std::memset(
+					map_info.data + channel_index * self->fmt_data->block_size + num_valid_block_bytes,
+					silence_pattern_byte,
+					num_dsd_padding_bytes
+				);
+			}
+		} else {
+			GST_WARNING_OBJECT(
+				self,
+				"could not map the copy of the last index's output buffer; "
+				"not replacing padding bytes with DSD silence pattern byte %#04x",
+				guint(silence_pattern_byte)
+			);
+			gst_buffer_replace(&writable_buffer, nullptr);
+		}
+	}
+
 	// Planar DSD content needs the plane offset meta attached to the buffer.
 
 	GstDsdPlaneOffsetMeta *dsd_plane_offset_meta = gst_buffer_add_dsd_plane_offset_meta(
@@ -1091,6 +1163,46 @@ static GstFlowReturn gst_dsfparse_parse_chunk_data(gpointer user_data, const Chu
 	guint64 payload_size = chunk.size;
 	guint64 num_available_bytes = self->upstream_size - gst_dsd_media_parse_get_current_byte_position(parse);
 	bool data_truncated = false;
+
+	// This covers very weird, rare cases where the actual data chunk size
+	// is _larger_ than what the "Sample Count" from the fmt chunk indicates.
+	// Ignore the useless extra bytes then by clamping the payload size to this.
+	//
+	// The number of blocks is computed separately from the byte count to be
+	// able to check the multiplication for an overflow. A corrupted sample
+	// count can produce a block count that is large enough to make
+	// (num_expected_blocks * alignment) exceed G_MAXUINT64, thus causing a
+	// wraparound. The result of that would be a small expected_payload_size
+	// that clamps away perfectly valid payload data. self->alignment is nonzero,
+	// since block_size is checked against zero in the fmt chunk parser, and
+	// num_channels is at least 1.
+	guint64 num_expected_blocks =
+		(self->fmt_data->expected_num_dsd_bytes_per_channel + (self->fmt_data->block_size - 1))
+		/ self->fmt_data->block_size;
+	if (G_UNLIKELY(num_expected_blocks > (G_MAXUINT64 / self->alignment))) {
+		// Not clamping in this case. The sample count is nonsense. The payload
+		// size is still bounded by the checks below though. Thus, parsing can
+		// continue with whatever the data chunk itself specifies.
+		GST_WARNING_OBJECT(
+			self,
+			"data chunk is larger than the sample count requires; ignoring the "
+			"extra bytes the sample count implies %" G_GUINT64_FORMAT " block(s) "
+			"of %" G_GUINT64_FORMAT " byte(s), which exceeds the 64-bit unsigned "
+			"integer range; not checking the data chunk size against the sample count",
+			num_expected_blocks,
+			self->alignment
+		);
+	} else {
+		guint64 expected_payload_size = num_expected_blocks * self->alignment;
+		if (G_UNLIKELY(payload_size > expected_payload_size)) {
+			GST_WARNING_OBJECT(
+				self,
+				"data chunk is larger than the sample count requires; "
+				"ignoring the extra bytes"
+			);
+			payload_size = expected_payload_size;
+		}
+	}
 
 	if (G_UNLIKELY(num_available_bytes < self->alignment)) {
 		GST_ELEMENT_ERROR(
