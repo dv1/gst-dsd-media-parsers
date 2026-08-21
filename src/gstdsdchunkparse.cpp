@@ -59,6 +59,9 @@ static GstFlowReturn gst_dsd_chunk_parse_scan_info(GstDsdMediaParse *parse);
 
 static bool gst_dsd_chunk_parse_verify_advance(GstDsdMediaParse *parse, guint64 byte_position, guint64 advance_amount, const gchar *advance_name);
 
+static GstFlowReturn gst_dsd_chunk_parse_handle_corrupted_chunk_structure(GstDsdChunkParse *self, const gchar *reason);
+static GstFlowReturn gst_dsd_chunk_parse_report_corrupted_chunk(GstDsdChunkParse *self, guint32 fourcc, const gchar *problem);
+
 static GstFlowReturn gst_dsd_chunk_parse_parse_chunk_start(GstDsdChunkParse *self);
 static GstFlowReturn gst_dsd_chunk_parse_parse_chunk_content(GstDsdChunkParse *self);
 static GstFlowReturn gst_dsd_chunk_parse_finish_chunk_parsing(GstDsdChunkParse *self);
@@ -143,6 +146,49 @@ static void gst_dsd_chunk_parse_teardown(GstDsdMediaParse *parse)
 }
 
 
+static GstFlowReturn gst_dsd_chunk_parse_handle_corrupted_chunk_structure(GstDsdChunkParse *self, const gchar *reason)
+{
+	GstDsdMediaParse *parse = GST_DSD_MEDIA_PARSE_CAST(self);
+
+	if (gst_dsd_media_parse_was_payload_reported(parse)) {
+		GST_WARNING_OBJECT(
+			self,
+			"%s; payload was already found -> treating this as "
+			"non-fatal and switching to Streaming stage immediately",
+			reason
+		);
+
+		gst_dsd_media_parse_scanning_finished(parse);
+
+		// Nothing was read in this invocation, hence NOTHING_TO_READ and not OK.
+		return GST_FLOW_NOTHING_TO_READ;
+	}
+
+	GST_ELEMENT_ERROR(
+		self,
+		STREAM,
+		DEMUX,
+		("Invalid or corrupted media."),
+		("%s", reason)
+	);
+
+	return GST_FLOW_ERROR;
+}
+
+
+static GstFlowReturn gst_dsd_chunk_parse_report_corrupted_chunk(GstDsdChunkParse *self, guint32 fourcc, const gchar *problem)
+{
+	gchar *reason = g_strdup_printf(
+		"chunk \"%" GST_FOURCC_FORMAT "\" %s",
+		GST_FOURCC_ARGS(fourcc),
+		problem
+	);
+	ScopeGuard reason_guard([&]() { g_free(reason); });
+
+	return gst_dsd_chunk_parse_handle_corrupted_chunk_structure(self, reason);
+}
+
+
 static GstFlowReturn gst_dsd_chunk_parse_scan_info(GstDsdMediaParse *parse)
 {
 	GstDsdChunkParse *self = GST_DSD_CHUNK_PARSE_CAST(parse);
@@ -164,6 +210,19 @@ static GstFlowReturn gst_dsd_chunk_parse_scan_info(GstDsdMediaParse *parse)
 
 		default:
 			g_assert_not_reached();
+	}
+
+	// A read or skip exceeded the bounds of the chunk it happened in. If this
+	// happened in a chunk that lies past the payload, we can recover, since
+	// chunks that lie beyond the payload are not essential. Try recovery
+	// before continuing. This is done before the is_currently_scanning()
+	// check below, since the corrupted chunk structure can finish the
+	// Scanning Info structure.
+	if (G_UNLIKELY(flow_ret == GST_FLOW_ADVANCE_OUT_OF_BOUNDS)) {
+		flow_ret = gst_dsd_chunk_parse_handle_corrupted_chunk_structure(
+			self,
+			"a read or skip during chunk parsing exceeded the bounds of the current chunk"
+		);
 	}
 
 	// This is called separately since gst_dsd_chunk_parse_parse_chunk_content()
@@ -292,22 +351,17 @@ static GstFlowReturn gst_dsd_chunk_parse_parse_chunk_start(GstDsdChunkParse *sel
 		: GST_READ_UINT64_LE(mapped_chunk_header_data.data() + 4);
 
 	if (G_UNLIKELY(priv->chunk_size_includes_chunk_header && (chunk_size < CHUNK_HEADER_SIZE))) {
-		GST_ELEMENT_ERROR(
-			self,
-			STREAM,
-			DEMUX,
-			("Invalid chunk size."),
-			(
-				"chunk \"%" GST_FOURCC_FORMAT "\" has size %" G_GUINT64_FORMAT ", and this "
-				"should include the %" G_GUINT64_FORMAT " bytes of the fourcc and size "
-				"integer, but the size is less than %" G_GUINT64_FORMAT,
-				GST_FOURCC_ARGS(chunk_fourcc),
-				chunk_size,
-				CHUNK_HEADER_SIZE,
-				CHUNK_HEADER_SIZE
-			)
+		gchar *reason = g_strdup_printf(
+			"chunk \"%" GST_FOURCC_FORMAT "\" has size %" G_GUINT64_FORMAT ", and this "
+			"should include the %" G_GUINT64_FORMAT " bytes of the fourcc and size "
+			"integer, but the size is less than %" G_GUINT64_FORMAT,
+			GST_FOURCC_ARGS(chunk_fourcc),
+			chunk_size,
+			CHUNK_HEADER_SIZE,
+			CHUNK_HEADER_SIZE
 		);
-		return GST_FLOW_ERROR;
+		ScopeGuard reason_guard([&]() { g_free(reason); });
+		return gst_dsd_chunk_parse_handle_corrupted_chunk_structure(self, reason);
 	}
 
 	if (priv->chunk_size_includes_chunk_header)
@@ -328,22 +382,17 @@ static GstFlowReturn gst_dsd_chunk_parse_parse_chunk_start(GstDsdChunkParse *sel
 		(padded_chunk_size < chunk_size) ||
 		(padded_chunk_size > (G_MAXUINT64 - chunk_payload_begin_pos))
 	)) {
-		GST_ELEMENT_ERROR(
-			self,
-			STREAM,
-			DEMUX,
-			("Invalid chunk size."),
-			(
-				"chunk \"%" GST_FOURCC_FORMAT "\" has size %" G_GUINT64_FORMAT ", and "
-				"its payload starts at %" G_GUINT64_FORMAT "; adding the size (and any "
-				"potentially present padding byte) to the payload start position "
-				"exceeds the range of a 64-bit unsigned integer",
-				GST_FOURCC_ARGS(chunk_fourcc),
-				chunk_size,
-				chunk_payload_begin_pos
-			)
+		gchar *reason = g_strdup_printf(
+			"chunk \"%" GST_FOURCC_FORMAT "\" has size %" G_GUINT64_FORMAT ", and "
+			"its payload starts at %" G_GUINT64_FORMAT "; adding the size (and any "
+			"potentially present padding byte) to the payload start position "
+			"exceeds the range of a 64-bit unsigned integer",
+			GST_FOURCC_ARGS(chunk_fourcc),
+			chunk_size,
+			chunk_payload_begin_pos
 		);
-		return GST_FLOW_ERROR;
+		ScopeGuard reason_guard([&]() { g_free(reason); });
+		return gst_dsd_chunk_parse_handle_corrupted_chunk_structure(self, reason);
 	}
 
 	// To factor in the padding byte in the parsing process, compute
@@ -397,44 +446,21 @@ static GstFlowReturn gst_dsd_chunk_parse_parse_chunk_start(GstDsdChunkParse *sel
 			break;
 
 		case ChunkStack::PushReturnCode::AlreadySeen:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				DEMUX,
-				("Invalid duplicate chunk."),
-				("chunk \"%" GST_FOURCC_FORMAT "\" has already been seen, but is supposed to be unique within its parent", GST_FOURCC_ARGS(chunk_fourcc))
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, chunk_fourcc,
+				"has already been seen, but is supposed to be unique within its parent");
 
 		case ChunkStack::PushReturnCode::IncorrectChunkSize:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				DEMUX,
-				("Incorrect chunk size."),
-				("chunk \"%" GST_FOURCC_FORMAT "\" has invalid size %" G_GUINT64_FORMAT, GST_FOURCC_ARGS(chunk_fourcc), chunk_size)
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, chunk_fourcc, "has an invalid size");
 
 		case ChunkStack::PushReturnCode::InsufficientChunkSize:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				DEMUX,
-				("Chunk with insufficient data found."),
-				("chunk \"%" GST_FOURCC_FORMAT "\" has insufficient bytes", GST_FOURCC_ARGS(chunk_fourcc))
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, chunk_fourcc, "has insufficient bytes");
 
 		case ChunkStack::PushReturnCode::ChunkOutOfParentBounds:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				DEMUX,
-				("Chunk is out of bounds of parent chunk."),
-				("chunk \"%" GST_FOURCC_FORMAT "\" exceeds the bounds of its parent chunk", GST_FOURCC_ARGS(chunk_fourcc))
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, chunk_fourcc, "exceeds the bounds of its parent chunk");
 	}
 
 	// A chunk with no payload is finished the moment its header has been read.
@@ -593,7 +619,7 @@ static GstFlowReturn gst_dsd_chunk_parse_finish_chunk_parsing(GstDsdChunkParse *
 			);
 			return GST_FLOW_ERROR;
 
-		case ChunkStack::PopReturnCode::NoChunksFinished:
+		case ChunkStack::PopReturnCode::NoChunksFinished: {
 			// Reaching this location means that the current chunk is supposed
 			// to be finished, so at least that chunk must have been popped.
 			// Every legitimate route into the FinishingChunk stage leaves the
@@ -608,57 +634,27 @@ static GstFlowReturn gst_dsd_chunk_parse_finish_chunk_parsing(GstDsdChunkParse *
 			// the parser would eventually stop with an error anyway - but that
 			// error would point at some later, unrelated position. Report it
 			// here instead, where the offending chunk is still known.
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				FAILED,
-				("Read error while parsing - chunk finished prematurely."),
-				(
-					"%s declared chunk \"%" GST_FOURCC_FORMAT "\" to be finished at "
-					"position %" G_GUINT64_FORMAT ", which is not the end of its payload",
-					G_OBJECT_TYPE_NAME(self),
-					GST_FOURCC_ARGS(current_chunk_fourcc),
-					current_byte_position
-				)
+			gchar *reason = g_strdup_printf(
+				"chunk \"%" GST_FOURCC_FORMAT "\" was declared to be finished at "
+				"position %" G_GUINT64_FORMAT ", which is not the end of its payload",
+				GST_FOURCC_ARGS(current_chunk_fourcc),
+				current_byte_position
 			);
-			return GST_FLOW_ERROR;
+			ScopeGuard reason_guard([&]() { g_free(reason); });
+			return gst_dsd_chunk_parse_handle_corrupted_chunk_structure(self, reason);
+		}
 
 		case ChunkStack::PopReturnCode::FinishFunctionFailed:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				FAILED,
-				("Read error while parsing - chunk could not be fully processed."),
-				(
-					"finish function for chunk \"%" GST_FOURCC_FORMAT "\" failed",
-					GST_FOURCC_ARGS(current_chunk_fourcc)
-				)
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, current_chunk_fourcc, "could not be fully processed by its finish function");
 
 		case ChunkStack::PopReturnCode::PositionOutOfChunkBounds:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				FAILED,
-				("Read error while parsing - chunk bounds exceeded."),
-				(
-					"parse position %" G_GUINT64_FORMAT " exceeds bounds of chunk \"%" GST_FOURCC_FORMAT "\"",
-					current_byte_position,
-					GST_FOURCC_ARGS(current_chunk_fourcc)
-				)
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, current_chunk_fourcc, "had its bounds exceeded by the parse position");
 
 		case ChunkStack::PopReturnCode::RequiredSubchunksMissing:
-			GST_ELEMENT_ERROR(
-				self,
-				STREAM,
-				FAILED,
-				("Read error while parsing - required chunks are missing."),
-				("a chunk did not contain all of its required subchunks")
-			);
-			return GST_FLOW_ERROR;
+			return gst_dsd_chunk_parse_report_corrupted_chunk(
+				self, current_chunk_fourcc, "did not contain all of its required subchunks");
 	}
 
 	return GST_FLOW_OK;

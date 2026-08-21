@@ -32,10 +32,10 @@ G_DECLARE_DERIVABLE_TYPE(GstDsdMediaParse, gst_dsd_media_parse, GST, DSD_MEDIA_P
 #define GST_DSD_MEDIA_PARSE_CAST(obj) ((GstDsdMediaParse *)(obj))
 
 
-// IMPORTANT IMPLEMENTATION NOTE: GST_FLOW_NOT_ENOUGH_DATA is a purely
-// internal custom return code, and must not go beyond the chain function
-// in push mode. Otherwise, it will be incorrectly interpreted as a
-// dataflow error.
+// IMPORTANT IMPLEMENTATION NOTE: GST_FLOW_NOT_ENOUGH_DATA, and
+// GST_FLOW_ADVANCE_OUT_OF_BOUNDS are purely internal custom return
+// codes, and must not go beyond the chain function in push mode.
+// Otherwise, they will be incorrectly interpreted as dataflow errors.
 
 /** Custom #GstFlowReturn used in push mode when the input adapter currently does not have enough data. */
 #define GST_FLOW_NOT_ENOUGH_DATA  (GstFlowReturn(GST_FLOW_CUSTOM_ERROR))
@@ -47,6 +47,21 @@ G_DECLARE_DERIVABLE_TYPE(GstDsdMediaParse, gst_dsd_media_parse, GST, DSD_MEDIA_P
  * anything is interpreted as a bug, and leads to an error report.
  */
 #define GST_FLOW_NOTHING_TO_READ  (GstFlowReturn(GST_FLOW_CUSTOM_SUCCESS))
+
+/**
+ * A custom #GstFlowReturn used solely in #GstDsdMediaParseClass::scan_info implementations.
+ *
+ * It is returned by gst_dsd_media_parse_read_data_during_scan() and
+ * gst_dsd_media_parse_skip_data_during_scan() when the verify_advance() vmethod
+ * returns false. This allows subclasses to tell when the read or skip operation
+ * failed due to an out of bounds error. Such error is not necessarily fatal -
+ * when portions of the media that lie beyond the payload exhibit such out of
+ * bounds problems, the subclass can opt to switch to the Streaming stage
+ * immediately. Anything past the payload is anyway considered non-essential
+ * (formats with essential information located beyond the payload are not
+ * supported by GstDsdMediaParse).
+ */
+#define GST_FLOW_ADVANCE_OUT_OF_BOUNDS  (GstFlowReturn(GST_FLOW_CUSTOM_ERROR_1))
 
 
 enum class ToIndexRoundingMode {
@@ -414,8 +429,9 @@ struct _GstDsdMediaParseClass {
 	 * byte_position is the byte position before it is avdanced. advance_amount
 	 * is the advance amount in bytes.
 	 *
-	 * If the advance exceeds bounds, this must call GST_ELEMENT_ERROR() with
-	 * details about this error.
+	 * Return false if - and only if - the advance would exceed the bounds that
+	 * this subclass keeps track of. Do _not_ report an element error in that
+	 * case; only log the details. Error handling is left up to the caller.
 	 *
 	 * Only used in the Scanning Info stage.
 	 *
@@ -567,6 +583,23 @@ guint64 gst_dsd_media_parse_get_current_byte_position(GstDsdMediaParse *parse);
  * Returns true if the base class is currently in the scanning info stage.
  */
 bool gst_dsd_media_parse_is_currently_scanning(GstDsdMediaParse *parse);
+
+/**
+ * Returns true if gst_dsd_media_parse_report_payload_found() has been called already.
+ *
+ * This is useful for deciding how to react to errors in the medium's structure.
+ * Before the payload is found, such an error is fatal, since essential data
+ * lies before the payload, and the payload cannot be located reliably. But
+ * once the payload is located,, everything that is left to scan is optional
+ * metadata, so scanning can simply be concluded with
+ * gst_dsd_media_parse_scanning_finished() instead - the metadata past that
+ * point is then lost, but the payload remains playable.
+ *
+ * Note that gst_dsd_media_parse_configure() must have been called before
+ * gst_dsd_media_parse_report_payload_found(), so a true return value here
+ * also implies that concluding the scan right away is safe.
+ */
+bool gst_dsd_media_parse_was_payload_reported(GstDsdMediaParse *parse);
 
 /**
  * Allows the subclass to perform manual internal seeking during the Scanning Info phase.

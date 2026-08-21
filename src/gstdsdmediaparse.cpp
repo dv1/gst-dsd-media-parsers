@@ -597,8 +597,27 @@ static gboolean gst_dsd_media_parse_sink_event(GstPad *pad, GstObject *parent, G
 			}
 
 			if (get_parse_stage(priv) != ParseStage::Streaming) {
-				// Upstream reached the end of the medium before this parser was done
-				// scanning it. The medium is therefore incomplete. (This can also be
+				// Reaching EOS during the Scanning Info stage is not fatal if the
+				// payload was already located. The metadata past the payload is
+				// lost, but it is not essential.
+				if ((get_parse_stage(priv) == ParseStage::ScanningInfo) &&
+				    gst_dsd_media_parse_was_payload_reported(self)) {
+					GST_WARNING_OBJECT(
+						self,
+						"got EOS while scanning, but the payload was already found; "
+						"concluding the scan - media might be corrupted, metadata "
+						"past the payload is unreadable, but payload can be used"
+					);
+
+					// NOTE: This seeks back to the payload, which also undoes the EOS
+					// state upstream, so the EOS event is not forwarded downstream.
+					gst_dsd_media_parse_scanning_finished(self);
+
+					return TRUE;
+				}
+
+				// Upstream reached the end of the medium before this parser located
+				// the payload. The medium is therefore unusable. (This can also be
 				// caused by a subclass that never finishes the Scanning Info stage.)
 				GST_ELEMENT_ERROR(
 					self, STREAM, DEMUX,
@@ -729,6 +748,24 @@ static GstFlowReturn gst_dsd_media_parse_sink_chain(GstPad *, GstObject *parent,
 						// _Not_ setting keep_parsing to false here. This is because
 						// scan_info() might have set internal states that will lead
 						// to data being produced in the next loop iteration.
+						break;
+
+					case GST_FLOW_ADVANCE_OUT_OF_BOUNDS:
+						// The subclass did not handle this, so treat it as the error
+						// it is. This custom code must never leave this function.
+						GST_ELEMENT_ERROR(
+							self,
+							STREAM,
+							DEMUX,
+							("Invalid or corrupted media."),
+							(
+								"a read or skip during scanning exceeded the bounds, "
+								"and %s did not handle the associated flow error code",
+								G_OBJECT_TYPE_NAME(self)
+							)
+						);
+						flow_ret = GST_FLOW_ERROR;
+						keep_parsing = false;
 						break;
 
 					default:
@@ -1498,6 +1535,23 @@ static void gst_dsd_media_parse_pull_mode_loop(gpointer user_data)
 					// _Not_ setting keep_parsing to false here. This is because
 					// scan_info() might have set internal states that will lead
 					// to data being produced in the next loop iteration.
+					break;
+
+				case GST_FLOW_ADVANCE_OUT_OF_BOUNDS:
+					// The subclass did not handle this, so treat it as the error
+					// it is. This custom code must never leave this function.
+					GST_ELEMENT_ERROR(
+						self,
+						STREAM,
+						DEMUX,
+						("Invalid or corrupted media."),
+						(
+							"a read or skip during scanning exceeded the bounds, "
+							"and %s did not handle the associated flow error code",
+							G_OBJECT_TYPE_NAME(self)
+						)
+					);
+					flow_ret = GST_FLOW_ERROR;
 					break;
 
 				default:
@@ -3057,7 +3111,7 @@ GstFlowReturn gst_dsd_media_parse_read_data_during_scan(GstDsdMediaParse *parse,
 				return GST_FLOW_NOT_ENOUGH_DATA;
 			} else {
 				if (!gst_dsd_media_parse_verify_advance(parse, num_bytes_to_read, "read"))
-					return GST_FLOW_ERROR;
+					return GST_FLOW_ADVANCE_OUT_OF_BOUNDS;
 
 				*data = gst_adapter_take_buffer(priv->input_adapter, num_bytes_to_read);
 				GST_LOG_OBJECT(
@@ -3075,7 +3129,7 @@ GstFlowReturn gst_dsd_media_parse_read_data_during_scan(GstDsdMediaParse *parse,
 			// possible, the input_adapter is not used at all here.
 
 			if (!gst_dsd_media_parse_verify_advance(parse, num_bytes_to_read, "read"))
-				return GST_FLOW_ERROR;
+				return GST_FLOW_ADVANCE_OUT_OF_BOUNDS;
 
 			GstFlowReturn flow_ret;
 
@@ -3180,7 +3234,7 @@ static GstFlowReturn gst_dsd_media_parse_skip_data_during_scan_full(GstDsdMediaP
 				*num_actually_skipped_bytes = num_bytes_to_skip;
 
 				if (!gst_dsd_media_parse_verify_advance(self, *num_actually_skipped_bytes, "skip"))
-					return GST_FLOW_ERROR;
+					return GST_FLOW_ADVANCE_OUT_OF_BOUNDS;
 
 				GST_LOG_OBJECT(
 					self,
@@ -3204,7 +3258,7 @@ static GstFlowReturn gst_dsd_media_parse_skip_data_during_scan_full(GstDsdMediaP
 
 					if (num_available_bytes > 0) {
 						if (!gst_dsd_media_parse_verify_advance(self, *num_actually_skipped_bytes, "skip"))
-							return GST_FLOW_ERROR;
+							return GST_FLOW_ADVANCE_OUT_OF_BOUNDS;
 
 						GST_LOG_OBJECT(
 							self,
@@ -3244,7 +3298,7 @@ static GstFlowReturn gst_dsd_media_parse_skip_data_during_scan_full(GstDsdMediaP
 					*num_actually_skipped_bytes = num_bytes_to_skip;
 
 					if (!gst_dsd_media_parse_verify_advance(self, *num_actually_skipped_bytes, "skip"))
-						return GST_FLOW_ERROR;
+						return GST_FLOW_ADVANCE_OUT_OF_BOUNDS;
 
 					GST_LOG_OBJECT(
 						self,
@@ -3311,7 +3365,7 @@ static GstFlowReturn gst_dsd_media_parse_skip_data_during_scan_full(GstDsdMediaP
 			*num_actually_skipped_bytes = num_bytes_to_skip;
 
 			if (!gst_dsd_media_parse_verify_advance(self, *num_actually_skipped_bytes, "skip"))
-				return GST_FLOW_ERROR;
+				return GST_FLOW_ADVANCE_OUT_OF_BOUNDS;
 
 			priv->byte_position += *num_actually_skipped_bytes;
 
@@ -3482,6 +3536,15 @@ bool gst_dsd_media_parse_is_currently_scanning(GstDsdMediaParse *parse)
 	g_assert(GST_IS_DSD_MEDIA_PARSE(parse));
 	GstDsdMediaParsePrivate *priv = get_private(parse);
 	return get_parse_stage(priv) == ParseStage::ScanningInfo;
+}
+
+
+bool gst_dsd_media_parse_was_payload_reported(GstDsdMediaParse *parse)
+{
+	g_assert(GST_IS_DSD_MEDIA_PARSE(parse));
+	GstDsdMediaParsePrivate *priv = get_private(parse);
+	std::lock_guard<std::mutex> lock(priv->field_mutex);
+	return priv->payload_position.has_value();
 }
 
 
