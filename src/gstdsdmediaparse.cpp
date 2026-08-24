@@ -893,7 +893,7 @@ static GstFlowReturn gst_dsd_media_parse_sink_chain(GstPad *, GstObject *parent,
 				// code) is returned. It is not an error; the code just
 				// has to try again next time this chain function is called,
 				// since when it is called, more data is pushed into it.
-				GST_DEBUG_OBJECT(self, "a read operation had insufficent data in the input adapter");
+				GST_LOG_OBJECT(self, "a read operation had insufficent data in the input adapter");
 				return GST_FLOW_OK;
 			}
 
@@ -1050,7 +1050,7 @@ static gboolean gst_dsd_media_parse_src_query(GstPad *pad, GstObject *parent, Gs
 				}
 			}
 
-			GST_DEBUG_OBJECT(self, "got duration query with format %s", gst_format_get_name(format));
+			GST_LOG_OBJECT(self, "got duration query with format %s", gst_format_get_name(format));
 
 			std::lock_guard<std::mutex> lock(priv->field_mutex);
 
